@@ -181,6 +181,14 @@ pub const ALL_CONFIG_SETTING_IDS: [ConfigSettingId; 6] = [
 #[derive(Debug, Clone, Default)]
 pub struct NetworkConfig {
     entries: HashMap<ConfigSettingId, ConfigSettingEntryRaw>,
+    /// The network's **current** ledger at the time of the fetch, from the
+    /// node's `latestLedger`.
+    ///
+    /// Distinct from every [`ConfigSettingEntryRaw::last_modified_ledger`],
+    /// which answers "when did this setting last change?". Settings only move
+    /// on protocol-governance events, so those stay frozen between upgrades
+    /// and cannot stand in for where the chain currently is (#267).
+    latest_ledger: Option<u64>,
 }
 
 impl NetworkConfig {
@@ -212,6 +220,7 @@ impl NetworkConfig {
         let response: GetLedgerEntriesResponse = client
             .call("getLedgerEntries", serde_json::to_value(params)?)
             .await?;
+        let latest_ledger = response.latest_ledger;
 
         // Build a lookup: entry key base64 → (xdr, last modified ledger)
         let mut entry_by_key: HashMap<String, (String, u32)> = HashMap::new();
@@ -238,8 +247,24 @@ impl NetworkConfig {
             );
         }
 
-        debug!(count = entries.len(), "all config settings fetched");
-        Ok(Self { entries })
+        debug!(
+            count = entries.len(),
+            ?latest_ledger,
+            "all config settings fetched"
+        );
+        Ok(Self {
+            entries,
+            latest_ledger,
+        })
+    }
+
+    /// The network's current ledger reported alongside the entries, if the
+    /// node provided one.
+    ///
+    /// This is what a snapshot should be stamped with, so "when was this
+    /// snapshot taken?" stays answerable (#267).
+    pub fn latest_ledger(&self) -> Option<u64> {
+        self.latest_ledger
     }
 
     /// Returns the raw entry for `setting_id`, or
@@ -323,15 +348,38 @@ impl ConfigCache {
     }
 }
 
+/// A batched `getLedgerEntries` result: the config entries plus the ledger the
+/// node served them at.
+///
+/// The two ledgers mean different things and must not be confused:
+///
+/// - `latest_ledger` is the network's **current** ledger — "where is the chain
+///   right now?".
+/// - [`ConfigSettingEntryRaw::last_modified_ledger`] is **per setting** — "when
+///   did this setting last change?".
+#[derive(Debug, Clone, Default)]
+pub struct ConfigSettingsFetch {
+    /// The config setting entries, in canonical setting order.
+    pub entries: Vec<ConfigSettingEntryRaw>,
+    /// The network's current ledger at the time of the fetch.
+    pub latest_ledger: Option<u64>,
+}
+
 /// Fetches all 6 Soroban config setting entries in a single batched RPC call.
+///
+/// Also returns the node's `latestLedger` — the network's **current** ledger —
+/// so callers stamping a snapshot can record where the chain actually was,
+/// rather than inferring it from the settings' `last_modified_ledger_seq`
+/// (which is frozen between governance events, see #267).
 ///
 /// # Network calls
 /// Makes 1 `getLedgerEntries` RPC call (all 6 keys batched).
-pub async fn fetch_all_config_settings(
-    client: &RpcClient,
-) -> AppResult<Vec<ConfigSettingEntryRaw>> {
+pub async fn fetch_all_config_settings(client: &RpcClient) -> AppResult<ConfigSettingsFetch> {
     let config = NetworkConfig::fetch(client).await?;
-    Ok(config.iter().cloned().collect())
+    Ok(ConfigSettingsFetch {
+        entries: config.iter().cloned().collect(),
+        latest_ledger: config.latest_ledger(),
+    })
 }
 
 #[cfg(test)]
@@ -346,14 +394,26 @@ mod tests {
 
     /// Base64 XDR for a `ContractComputeV0` ledger entry, small enough to
     /// inline. Only its presence matters here — the tests below assert on
-    /// request counts and key round-tripping, not on decoded values.
+    /// request counts, key round-tripping, and ledgers, not on decoded values.
     const DUMMY_ENTRY_XDR: &str = "AAAAAAAAAAEAAAAH";
+
+    /// The ledger values a stub reports by default.
+    const DEFAULT_LAST_MODIFIED: u32 = 42;
+    const DEFAULT_LATEST_LEDGER: u64 = 100;
 
     /// Spawns a JSON-RPC stub that answers `getLedgerEntries` by echoing back
     /// every requested key with a dummy payload, and counts the requests it
     /// received. Echoing the keys lets the client match entries back to config
     /// setting IDs the way a real node would.
-    async fn spawn_ledger_entries_stub() -> (String, Arc<AtomicUsize>) {
+    ///
+    /// `last_modified` becomes each entry's `lastModifiedLedgerSeq` and
+    /// `latest` the response's `latestLedger`; passing `None` for `latest`
+    /// omits the field entirely, so the "node does not report it" case is
+    /// genuinely absent from the payload.
+    async fn spawn_ledger_entries_stub_with(
+        last_modified: u32,
+        latest: Option<u64>,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind stub server");
@@ -368,7 +428,8 @@ mod tests {
                 };
                 let counter = Arc::clone(&server_counter);
                 tokio::spawn(async move {
-                    let _ = handle_ledger_entries_conn(stream, counter).await;
+                    let _ =
+                        handle_ledger_entries_conn(stream, counter, last_modified, latest).await;
                 });
             }
         });
@@ -376,9 +437,16 @@ mod tests {
         (format!("http://{addr}"), counter)
     }
 
+    /// [`spawn_ledger_entries_stub_with`] with the default ledger values.
+    async fn spawn_ledger_entries_stub() -> (String, Arc<AtomicUsize>) {
+        spawn_ledger_entries_stub_with(DEFAULT_LAST_MODIFIED, Some(DEFAULT_LATEST_LEDGER)).await
+    }
+
     async fn handle_ledger_entries_conn(
         mut stream: TcpStream,
         counter: Arc<AtomicUsize>,
+        last_modified: u32,
+        latest: Option<u64>,
     ) -> std::io::Result<()> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 1024];
@@ -409,7 +477,7 @@ mod tests {
                         serde_json::json!({
                             "key": key.as_str().unwrap_or_default(),
                             "xdr": DUMMY_ENTRY_XDR,
-                            "lastModifiedLedgerSeq": 42,
+                            "lastModifiedLedgerSeq": last_modified,
                         })
                     })
                     .collect()
@@ -418,10 +486,17 @@ mod tests {
 
         counter.fetch_add(1, Ordering::SeqCst);
 
+        let mut result = serde_json::json!({ "entries": entries });
+        // Only present the field when the scenario asks for it, so the
+        // "node omits latestLedger" case really is missing from the payload.
+        if let Some(latest) = latest {
+            result["latestLedger"] = serde_json::json!(latest);
+        }
+
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "result": { "latestLedger": 100, "entries": entries },
+            "result": result,
         })
         .to_string();
 
@@ -466,7 +541,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} should be present: {e}", id.human_name()));
             assert_eq!(entry.id, id, "entry should carry its own setting id");
             assert_eq!(entry.config_xdr, DUMMY_ENTRY_XDR);
-            assert_eq!(entry.last_modified_ledger, 42);
+            assert_eq!(entry.last_modified_ledger, DEFAULT_LAST_MODIFIED);
         }
     }
 
@@ -605,5 +680,97 @@ mod tests {
             );
             keys.push(key);
         }
+    }
+
+    /// Regression test for #267: the batched fetch must surface the node's
+    /// `latestLedger` (the network's *current* ledger) alongside the entries,
+    /// and must keep the entries' much older `last_modified_ledger` separate
+    /// rather than conflating the two.
+    #[tokio::test]
+    async fn test_fetch_surfaces_current_ledger_distinct_from_last_modified() {
+        // The values observed on testnet in #267.
+        const LAST_MODIFIED: u32 = 3_470_630;
+        const CURRENT: u64 = 4_635_340;
+
+        let (url, _counter) = spawn_ledger_entries_stub_with(LAST_MODIFIED, Some(CURRENT)).await;
+        let client = RpcClient::new(&url);
+
+        let fetched = fetch_all_config_settings(&client)
+            .await
+            .expect("fetch should succeed");
+
+        assert_eq!(
+            fetched.latest_ledger,
+            Some(CURRENT),
+            "the node's current ledger must be reported verbatim"
+        );
+        assert!(
+            fetched
+                .entries
+                .iter()
+                .all(|e| e.last_modified_ledger == LAST_MODIFIED),
+            "per-setting last_modified_ledger must be preserved as-is"
+        );
+        assert!(
+            CURRENT > u64::from(LAST_MODIFIED),
+            "the test is only meaningful while the two values differ"
+        );
+    }
+
+    /// The current ledger cannot be reconstructed from the entries: two
+    /// fetches against an advanced chain return different ledgers even though
+    /// the settings themselves have not changed.
+    #[tokio::test]
+    async fn test_current_ledger_varies_while_settings_stay_frozen() {
+        const LAST_MODIFIED: u32 = 3_470_630;
+
+        let (url_a, _c1) = spawn_ledger_entries_stub_with(LAST_MODIFIED, Some(4_635_340)).await;
+        let (url_b, _c2) = spawn_ledger_entries_stub_with(LAST_MODIFIED, Some(4_635_412)).await;
+
+        let first = fetch_all_config_settings(&RpcClient::new(&url_a))
+            .await
+            .expect("first fetch should succeed");
+        let second = fetch_all_config_settings(&RpcClient::new(&url_b))
+            .await
+            .expect("second fetch should succeed");
+
+        assert_eq!(first.latest_ledger, Some(4_635_340));
+        assert_eq!(second.latest_ledger, Some(4_635_412));
+        assert_ne!(
+            first.latest_ledger, second.latest_ledger,
+            "the current ledger must move as the chain advances"
+        );
+
+        // The frozen per-setting values are identical, which is precisely why
+        // they cannot stand in for the current ledger.
+        let frozen: Vec<u32> = first
+            .entries
+            .iter()
+            .map(|e| e.last_modified_ledger)
+            .collect();
+        let frozen_again: Vec<u32> = second
+            .entries
+            .iter()
+            .map(|e| e.last_modified_ledger)
+            .collect();
+        assert_eq!(frozen, frozen_again);
+    }
+
+    /// A node that omits `latestLedger` must yield `None` rather than a
+    /// fabricated value, so the caller can fall back explicitly.
+    #[tokio::test]
+    async fn test_missing_latest_ledger_is_reported_as_none() {
+        let (url, _counter) = spawn_ledger_entries_stub_with(3_470_630, None).await;
+        let client = RpcClient::new(&url);
+
+        let fetched = fetch_all_config_settings(&client)
+            .await
+            .expect("fetch should still succeed");
+
+        assert_eq!(
+            fetched.latest_ledger, None,
+            "an absent latestLedger must not be guessed at"
+        );
+        assert_eq!(fetched.entries.len(), 6);
     }
 }
